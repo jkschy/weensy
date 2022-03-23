@@ -60,12 +60,12 @@ void kernel_start(const char* command) {
     console_clear();
 
     // (re-)initialize kernel page table
-    for (vmiter it(kernel_pagetable);
-         it.va() < MEMSIZE_PHYSICAL;
-         it += PAGESIZE) {
-        if (it.va() != 0) {
-            it.map(it.va(), PTE_P | PTE_W | PTE_U);
-        } else {
+    for (vmiter it(kernel_pagetable); it.va() < MEMSIZE_PHYSICAL; it += PAGESIZE) {
+		 if (it.va() < PROC_START_ADDR && it.va() != CONSOLE_ADDR) {
+		 	it.map(it.va(), PTE_P | PTE_W);
+		 } else if (it.va() != 0) {
+            it.map(it.va(), PTE_P | PTE_U | PTE_W);
+       	 }  else {
             // nullptr is inaccessible even to the kernel
             it.map(it.va(), 0);
         }
@@ -306,7 +306,11 @@ uintptr_t syscall(regstate* regs) {
         schedule();             // does not return
 
     case SYSCALL_PAGE_ALLOC:
-        return syscall_page_alloc(current->regs.reg_rdi);
+    	if (current->regs.reg_rdi >= PROC_START_ADDR && current->regs.reg_rdi < MEMSIZE_VIRTUAL) {
+    		return syscall_page_alloc(current->regs.reg_rdi);
+    	} else {
+    		return -1;
+    	}
 
     default:
         panic("Unexpected system call %ld!\n", regs->reg_rax);
