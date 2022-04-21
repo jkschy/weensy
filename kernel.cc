@@ -60,15 +60,17 @@ void kernel_start(const char* command) {
     console_clear();
 
     // (re-)initialize kernel page table
-    for (vmiter it(kernel_pagetable); it.va() < MEMSIZE_PHYSICAL; it += PAGESIZE) {
-		 if (it.va() < PROC_START_ADDR && it.va() != CONSOLE_ADDR) {
-		 	it.map(it.va(), PTE_P | PTE_W);
-		 } else if (it.va() != 0) {
-            it.map(it.va(), PTE_P | PTE_U | PTE_W);
-       	 }  else {
-            // nullptr is inaccessible even to the kernel
+   for (vmiter it(kernel_pagetable); it.va() < MEMSIZE_PHYSICAL; it += PAGESIZE) {
+   		if (it.va() != 0 ) {
+   			if (it.va() == CONSOLE_ADDR || it.va() >= PROC_START_ADDR) {
+   				it.map(it.va(), PTE_P | PTE_U | PTE_W);
+   			} else {
+   				it.map(it.va(), PTE_P | PTE_W);
+   			}
+   		} else {
+   			// nullptr is inaccessible even to the kernel
             it.map(it.va(), 0);
-        }
+   		}
     }
 
     // set up process descriptors
@@ -147,41 +149,70 @@ void process_setup(pid_t pid, const char* program_name) {
     init_process(&ptable[pid], 0);
 
     // initialize process page table
-    ptable[pid].pagetable = kernel_pagetable;
+    ptable[pid].pagetable = (x86_64_pagetable*)kalloc_pagetable();
+    
+   for (vmiter it(ptable[pid].pagetable); it.va() < MEMSIZE_PHYSICAL; it += PAGESIZE) {
+   		if (it.va() != 0 ) {
+   			if (it.va() == CONSOLE_ADDR) {
+   				it.map(it.va(), PTE_P | PTE_U | PTE_W);
+   			} else if (it.va() < PROC_START_ADDR){
+   				it.map(it.va(), PTE_P | PTE_W);
+   			}
+   		} else {
+   			// nullptr is inaccessible even to the kernel
+            it.map(it.va(), 0);
+   		}
+    }
 
     // obtain reference to the program image
     program_image pgm(program_name);
 
     // allocate and map global memory required by loadable segments
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-        for (uintptr_t a = round_down(seg.va(), PAGESIZE);
-             a < seg.va() + seg.size();
-             a += PAGESIZE) {
+	    for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size();a += PAGESIZE) {
             // `a` is the process virtual address for the next code or data page
             // (The handout code requires that the corresponding physical
             // address is currently free.)
-            assert(physpages[a / PAGESIZE].refcount == 0);
-            ++physpages[a / PAGESIZE].refcount;
+            void* pageAddr = kalloc(PAGESIZE);
+            
+            if (pageAddr) {
+            	vmiter(ptable[pid].pagetable, a).map(pageAddr, PTE_P | PTE_W | PTE_U);
+				memset(pageAddr, 0, PAGESIZE);
+            }
+
         }
     }
-
+    
+    set_pagetable(ptable[pid].pagetable);
     // initialize data in loadable segments
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
         memset((void*) seg.va(), 0, seg.size());
         memcpy((void*) seg.va(), seg.data(), seg.data_size());
     }
+   	set_pagetable(kernel_pagetable);
+    
+
 
     // mark entry point
     ptable[pid].regs.reg_rip = pgm.entry();
 
+
     // allocate and map stack segment
     // Compute process virtual address for stack page
-    uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE;
+    uintptr_t stack_addr = MEMSIZE_VIRTUAL - PAGESIZE;
+    	
+
+
     // The handout code requires that the corresponding physical address
     // is currently free.
-    assert(physpages[stack_addr / PAGESIZE].refcount == 0);
-    ++physpages[stack_addr / PAGESIZE].refcount;
+    void* pageAddr = kalloc(PAGESIZE);
+    if (pageAddr) {
+      	vmiter(ptable[pid].pagetable, stack_addr).map(pageAddr, PTE_P | PTE_W | PTE_U);
+ 		memset(pageAddr, 0, PAGESIZE);
+    }
+
     ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
+
 
     // mark process as runnable
     ptable[pid].state = P_RUNNABLE;
@@ -263,6 +294,45 @@ void exception(regstate* regs) {
     }
 }
 
+pid_t fork() {
+	pid_t child = -1;
+
+	for (int i = 1; i < NPROC; i++) { 
+		if (ptable[i].state == P_FREE) {
+				child = i;
+				ptable[child].state = P_RUNNABLE;
+				break;						
+			}
+		}
+
+	if (child <= 0) {
+		return -1;
+	}
+		
+	ptable[child].pagetable = (x86_64_pagetable*)kalloc_pagetable();
+	
+    for (vmiter it(current->pagetable); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE) {
+    	if (it.va() == 0) {
+    		continue;
+    	}
+    	
+   		if (it.va() < PROC_START_ADDR) {
+	        vmiter(ptable[child].pagetable, it.va()).map(it.kptr(), it.perm());	 
+	        
+	   	} else if (it.present() && it.user()) {
+	   	   	void* pageAddr = kalloc(PAGESIZE);
+	   	   	
+            if (pageAddr) {
+	  			memcpy(pageAddr, (void*)it.kptr(), PAGESIZE);
+	  			vmiter(ptable[child].pagetable, it.va()).map(pageAddr, it.perm());
+	   		}	
+	   	}
+    }
+
+    ptable[child].regs = current->regs;
+    ptable[child].regs.reg_rax = 0;
+   	return child;
+ }
 
 // syscall(regs)
 //    System call handler.
@@ -311,7 +381,9 @@ uintptr_t syscall(regstate* regs) {
     	} else {
     		return -1;
     	}
-
+    case SYSCALL_FORK:
+		return fork();
+   	
     default:
         panic("Unexpected system call %ld!\n", regs->reg_rax);
 
@@ -327,10 +399,14 @@ uintptr_t syscall(regstate* regs) {
 //    in `u-lib.hh` (but in the handout code, it does not).
 
 int syscall_page_alloc(uintptr_t addr) {
-    assert(physpages[addr / PAGESIZE].refcount == 0);
-    ++physpages[addr / PAGESIZE].refcount;
-    memset((void*) addr, 0, PAGESIZE);
-    return 0;
+    void* pageAddr = kalloc(PAGESIZE);
+    if (pageAddr) {
+    	vmiter(current, addr).map(pageAddr, PTE_P | PTE_W | PTE_U);
+    	memset(pageAddr, 0, PAGESIZE);
+    	return 0;
+    } else {
+    	return -1;
+    }
 }
 
 
